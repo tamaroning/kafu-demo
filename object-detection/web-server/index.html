@@ -1,0 +1,354 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Demo – Video + Detection Overlay</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      display: grid;
+      place-items: center;
+      height: 100vh;
+    }
+
+    #wrap {
+      position: relative;
+      display: inline-block;
+    }
+
+    #video {
+      image-rendering: pixelated;
+      display: block;
+    }
+
+    #overlay {
+      position: absolute;
+      left: 0;
+      top: 0;
+      pointer-events: none;
+    }
+
+    #hud {
+      position: fixed;
+      top: 4px;
+      left: 4px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.55);
+      color: #e6e6e6;
+      font: 12px/1.1 ui-monospace, monospace;
+      z-index: 10;
+      white-space: pre;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">
+    <div>
+      FPS: <span id="fps">--</span>
+      RX: <span id="rx">--</span> Mbps
+      Detections: <span id="detections">--</span>
+      VFrame: <span id="vframe">--</span>
+      DFrame: <span id="dframe">--</span>
+      Buffer: <span id="bufferSize">0</span>
+      <span id="advToggle" style="cursor:pointer;color:#888;font-size:12px">[+]</span><br>
+      <span id="advControls" style="display:none">
+        Delay: <span id="delayVal">900</span>ms <input type="range" id="delaySlider" min="0" max="2000" step="25"
+          value="900">
+        SyncOffset: <span id="offsetVal">0</span>f <input type="range" id="offsetSlider" min="-200" max="200" step="1"
+          value="0">
+        <!-- FPSの逆数を入れる: 0.75FPSなら1/0.75=1.333s-->
+      </span>
+    </div>
+
+  </div>
+  <div id="wrap">
+    <canvas id="video"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+  <script>
+    const videoCanvas = document.getElementById("video");
+    const overlayCanvas = document.getElementById("overlay");
+    const hud = document.getElementById("hud");
+    const fpsSpan = document.getElementById("fps");
+    const rxSpan = document.getElementById("rx");
+    const detectionsSpan = document.getElementById("detections");
+    const vframeSpan = document.getElementById("vframe");
+    const dframeSpan = document.getElementById("dframe");
+    const bufferSizeSpan = document.getElementById("bufferSize");
+    const delaySlider = document.getElementById("delaySlider");
+    const delayValSpan = document.getElementById("delayVal");
+    const offsetSlider = document.getElementById("offsetSlider");
+    const offsetValSpan = document.getElementById("offsetVal");
+
+    const advToggle = document.getElementById("advToggle");
+    const advControls = document.getElementById("advControls");
+    advToggle.addEventListener("click", () => {
+      const hidden = advControls.style.display === "none";
+      advControls.style.display = hidden ? "inline" : "none";
+      advToggle.textContent = hidden ? "[-]" : "[+]";
+    });
+
+    const statusMsg = document.getElementById("statusMsg");
+    const vCtx = videoCanvas.getContext("2d");
+    const oCtx = overlayCanvas.getContext("2d");
+
+    const MAX_FPS = 60;
+    const MIN_DRAW_INTERVAL_MS = 1000 / MAX_FPS;
+
+    let W = null, H = null;
+    let inferW = null, inferH = null;
+    let displayW = 0, displayH = 0, displayScale = 1;
+    let frameBytes = 0;
+    let videoFramesPerInferFrame = 1;
+    let videoHeaderBytes = 0;
+    let displayedVideoFrame = -1;
+    let detectionsQueue = [];
+    let activeDetections = { inferFrame: -1, videoFrame: -1, detections: [] };
+    let latestFrame = null;
+    let latestFrameId = -1;
+    let frameQueue = [];
+    let drawCount = 0;
+    let lastFpsTime = performance.now();
+    let lastDrawAtMs = 0;
+    let lastRxMbps = null;
+
+    // Classes to hide from the overlay (no bounding box / label drawn).
+    const NO_DISPLAY_CLASSES = new Set([
+      "person",
+      "laptop",
+      "suitcase",
+      "toilet",
+    ]);
+
+    const COCO_CLASSES = [
+      "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+      "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter",
+      "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear",
+      "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase",
+      "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
+      "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+      "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+      "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut",
+      "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet",
+      "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+      "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+      "scissors", "teddy bear", "hair drier", "toothbrush"
+    ];
+
+    function initFrame(w, h) {
+      W = w;
+      H = h;
+      frameBytes = W * H * 3;
+      // Video canvas stays at stream resolution (putImageData needs exact pixel match)
+      videoCanvas.width = W;
+      videoCanvas.height = H;
+      const TARGET_W = 500;
+      displayScale = TARGET_W / W;
+      displayW = Math.round(W * displayScale);
+      displayH = Math.round(H * displayScale);
+      // Overlay canvas uses display resolution so line widths and fonts stay crisp
+      overlayCanvas.width = displayW;
+      overlayCanvas.height = displayH;
+      overlayCanvas.style.width = videoCanvas.style.width = displayW + "px";
+      overlayCanvas.style.height = videoCanvas.style.height = displayH + "px";
+    }
+
+    function drawDetections() {
+      overlayCanvas.width = overlayCanvas.width; // clear
+      if (!W || !H || !activeDetections.detections || !activeDetections.detections.length) return;
+
+      // Scale factor from inference coordinates to stream (preview) coordinates.
+      // bbox values are in inference resolution; we first map them to stream resolution,
+      // then displayScale maps stream resolution to the on-screen display size.
+      const iW = inferW || W;
+      const iH = inferH || H;
+      const inferToStreamX = W / iW;
+      const inferToStreamY = H / iH;
+
+      // Map stream coordinates to display coordinates
+      oCtx.scale(displayScale, displayScale);
+      const d = activeDetections.detections;
+      // Use inverse scale so line width / font size stay constant in display pixels
+      const lw = 2 / displayScale;
+      const fontSize = Math.round(14 / displayScale);
+      for (let i = 0; i < d.length; i++) {
+        const box = d[i];
+        const x1 = box.x1 * inferToStreamX;
+        const y1 = box.y1 * inferToStreamY;
+        const x2 = box.x2 * inferToStreamX;
+        const y2 = box.y2 * inferToStreamY;
+        const classId = typeof box.class === "number" ? box.class : 0;
+        const label = COCO_CLASSES[classId] || ("class " + classId);
+        if (NO_DISPLAY_CLASSES.has(label)) continue;
+        const hue = (classId * 37) % 360;
+        oCtx.strokeStyle = "hsla(" + hue + ", 80%, 55%, 0.9)";
+        oCtx.lineWidth = lw;
+        oCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        oCtx.font = fontSize + "px sans-serif";
+        oCtx.fillStyle = "hsla(" + hue + ", 80%, 55%, 0.9)";
+        oCtx.fillText(label, x1, y1 - 4 / displayScale);
+      }
+    }
+
+    const wsBase = "ws://" + location.host;
+
+    // /video: binary frames only (no text mixed in)
+    const wsVideo = new WebSocket(wsBase + "/video");
+    wsVideo.binaryType = "arraybuffer";
+    wsVideo.onmessage = (ev) => {
+      const ab = ev.data;
+      if (!(ab instanceof ArrayBuffer) || !W || !H) return;
+      if (frameBytes <= 0) return;
+
+      // New format: [uint32le frameId][rgb24 bytes...]
+      if (videoHeaderBytes === 4 && ab.byteLength === frameBytes + 4) {
+        const dv = new DataView(ab);
+        const frameId = dv.getUint32(0, true);
+        frameQueue.push({
+          frameId,
+          data: ab.slice(4),
+          receivedAt: performance.now()
+        });
+      } else if (ab.byteLength === frameBytes) {
+        // Backward-compatible: raw rgb24 frame only (no header)
+        frameQueue.push({
+          frameId: -1,
+          data: ab.slice(0),
+          receivedAt: performance.now()
+        });
+      } else {
+        return;
+      }
+      // Safety cap: drop oldest if too full (avoid memory issues)
+      if (frameQueue.length > 300) {
+        frameQueue.shift();
+      }
+    };
+    wsVideo.onerror = () => { if (statusMsg) statusMsg.textContent = "WebSocket /video error"; };
+
+    // /events: text only (meta + detection JSON)
+    const wsEvents = new WebSocket(wsBase + "/events");
+    wsEvents.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "meta") {
+        if (msg.pending) return;
+        initFrame(msg.w, msg.h);
+        // Inference resolution (bbox coordinates live in this space).
+        // Falls back to stream (preview) dimensions when not provided.
+        inferW = (typeof msg.inferW === "number" && msg.inferW > 0) ? msg.inferW : msg.w;
+        inferH = (typeof msg.inferH === "number" && msg.inferH > 0) ? msg.inferH : msg.h;
+        if (typeof msg.videoFramesPerInferFrame === "number" && msg.videoFramesPerInferFrame > 0) {
+          videoFramesPerInferFrame = msg.videoFramesPerInferFrame | 0;
+        } else {
+          videoFramesPerInferFrame = 1;
+        }
+        if (typeof msg.videoHeaderBytes === "number" && msg.videoHeaderBytes > 0) {
+          videoHeaderBytes = msg.videoHeaderBytes | 0;
+        } else {
+          videoHeaderBytes = 0;
+        }
+        return;
+      }
+      if (msg.type === "rx") {
+        lastRxMbps = typeof msg.mbps === "number" ? msg.mbps : null;
+        return;
+      }
+      if (msg.type === "vframe") {
+        // For debugging only. Sync uses frame id embedded in /video payload.
+        return;
+      }
+      if (msg.detections) {
+        const inferFrame = (typeof msg.frame === "number") ? (msg.frame | 0) : -1;
+        const offsetFrames = offsetSlider ? (parseInt(offsetSlider.value, 10) | 0) : 0;
+        if (offsetValSpan) offsetValSpan.textContent = offsetFrames;
+        const mappedVideoFrame = (inferFrame >= 0) ? (inferFrame * videoFramesPerInferFrame + offsetFrames) : -1;
+        const entry = {
+          inferFrame,
+          videoFrame: mappedVideoFrame,
+          detections: Array.isArray(msg.detections) ? msg.detections : [],
+        };
+        detectionsQueue.push(entry);
+        if (detectionsQueue.length > 2000) detectionsQueue.shift();
+        // Backward-compatible fallback when video frames have no embedded frame id.
+        if (displayedVideoFrame < 0) activeDetections = entry;
+      }
+      drawDetections();
+    };
+    wsEvents.onerror = () => { if (statusMsg) statusMsg.textContent = "WebSocket /events error"; };
+
+    function render() {
+      try {
+        const now = performance.now();
+        const canDraw = (now - lastDrawAtMs) >= MIN_DRAW_INTERVAL_MS;
+
+        let videoDelayMs = 100;
+        if (delaySlider && delayValSpan) {
+          videoDelayMs = parseInt(delaySlider.value, 10);
+          delayValSpan.textContent = videoDelayMs;
+        }
+
+        // Consume frames that are old enough to be shown.
+        // We process all "ready" frames so we don't fall behind the delay window.
+        // The last one we shift out is the most recent "ready" frame.
+        while (frameQueue.length > 0 && frameQueue[0].receivedAt <= now - videoDelayMs) {
+          const e = frameQueue.shift();
+          latestFrame = e.data;
+          latestFrameId = (typeof e.frameId === "number") ? e.frameId : -1;
+        }
+
+        // Pick the most recent detection whose mapped video frame is not ahead of currentVideoFrame.
+        // This keeps overlay stable even when inference FPS is much lower than video FPS.
+        displayedVideoFrame = latestFrameId;
+        if (displayedVideoFrame >= 0 && detectionsQueue.length > 0) {
+          let best = null;
+          for (let i = detectionsQueue.length - 1; i >= 0; i--) {
+            const d = detectionsQueue[i];
+            if (typeof d.videoFrame === "number" && d.videoFrame >= 0 && d.videoFrame <= displayedVideoFrame) {
+              best = d;
+              break;
+            }
+          }
+          if (best) activeDetections = best;
+        }
+
+        if (canDraw && latestFrame && W && H && frameBytes && latestFrame.byteLength === frameBytes) {
+          const bytes = new Uint8Array(latestFrame);
+          const id = vCtx.createImageData(W, H);
+          for (let i = 0; i < W * H; i++) {
+            id.data[i * 4 + 0] = bytes[i * 3 + 0];
+            id.data[i * 4 + 1] = bytes[i * 3 + 1];
+            id.data[i * 4 + 2] = bytes[i * 3 + 2];
+            id.data[i * 4 + 3] = 255;
+          }
+          vCtx.putImageData(id, 0, 0);
+          drawDetections();
+          drawCount++;
+          lastDrawAtMs = now;
+        }
+        if (now - lastFpsTime >= 1000) {
+          fpsSpan.textContent = drawCount.toFixed(1);
+          rxSpan.textContent = (typeof lastRxMbps === "number") ? lastRxMbps.toFixed(2) : "--";
+          detectionsSpan.textContent = (activeDetections.detections ? activeDetections.detections.length : 0);
+          if (vframeSpan) vframeSpan.textContent = (displayedVideoFrame >= 0) ? String(displayedVideoFrame) : "--";
+          if (dframeSpan) dframeSpan.textContent = (activeDetections.inferFrame >= 0) ? String(activeDetections.inferFrame) : "--";
+          if (bufferSizeSpan) bufferSizeSpan.textContent = frameQueue.length;
+
+          drawCount = 0;
+          lastFpsTime = now;
+        }
+      } catch (err) {
+        console.error("Render loop error:", err);
+        if (statusMsg) statusMsg.textContent = "Render error: " + err.message;
+      }
+      requestAnimationFrame(render);
+    }
+    requestAnimationFrame(render);
+  </script>
+</body>
+
+</html>

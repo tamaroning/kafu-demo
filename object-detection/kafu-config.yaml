@@ -1,0 +1,21 @@
+name: demo-detect-objects
+app:
+  path: ./wasm/detect-kafu-main.wasm
+  args:
+    - "352" # TODO: Set width of the video
+    - "352" # TODO: Set height of the video
+    - models/yolo11n.onnx
+    - "0.20"
+    - "0.45"
+  preopened_dir: .
+nodes:
+  cloud:
+    address: 127.0.0.1
+    port: 50051
+  edge:
+    address: 127.0.0.1
+    port: 50052
+cluster:
+  migration:
+    memory_migration: delta
+    memory_compression: false

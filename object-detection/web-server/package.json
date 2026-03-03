@@ -1,0 +1,14 @@
+{
+  "name": "kafu-demo-web-server",
+  "version": "1.0.0",
+  "description": "Receives video stream (stdin) and detection stream (TCP), draws overlay via WebSocket",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js 480 270"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "keywords": ["kafu", "websocket", "streaming", "detection"],
+  "license": "ISC"
+}
